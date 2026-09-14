@@ -11,6 +11,7 @@ constexpr int select_all = 40110;
 constexpr int remove_selected = 40111;
 constexpr int properties = 40112;
 constexpr int copy = 40113;
+constexpr int select_none = 40114;
 
 constexpr int show_enumerator = 40120;
 constexpr int show_service = 40121;
@@ -21,6 +22,7 @@ constexpr int show_swd = 40125;
 constexpr int show_sw = 40126;
 constexpr int dark_mode = 40127;
 constexpr int always_on_top = 40128;
+constexpr int allow_protected_removal = 40129;
 
 constexpr int bluetooth = 40130;
 constexpr int device_manager = 40131;

@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(Sonic79Reconstructed VERSION 1.0.0 LANGUAGES CXX RC)
 
 add_executable(Sonic79Reconstructed WIN32
+    resources/app.manifest
     resources/app.rc
     src/app_window.cpp
     src/bluetooth_dialog.cpp
@@ -10,7 +11,9 @@ add_executable(Sonic79Reconstructed WIN32
     src/com_port_manager.cpp
     src/device_manager.cpp
     src/device_rules.cpp
+    src/device_safety.cpp
     src/main.cpp
+    src/process_runner.cpp
     src/settings.cpp
     src/system_restore.cpp
     src/win32_helpers.cpp
@@ -47,10 +50,14 @@ if(BUILD_TESTING)
     add_executable(core_tests
         tests/core_tests.cpp
         src/device_rules.cpp
+        src/device_safety.cpp
+        src/process_runner.cpp
+        src/win32_helpers.cpp
     )
     target_compile_features(core_tests PRIVATE cxx_std_20)
     target_compile_definitions(core_tests PRIVATE UNICODE _UNICODE NOMINMAX)
     target_include_directories(core_tests PRIVATE src)
+    target_link_libraries(core_tests PRIVATE Advapi32 Shell32 User32)
     add_test(NAME core_tests COMMAND core_tests)
 
     add_executable(enumeration_smoke
@@ -58,6 +65,8 @@ if(BUILD_TESTING)
         src/com_port_manager.cpp
         src/device_manager.cpp
         src/device_rules.cpp
+        src/device_safety.cpp
+        src/process_runner.cpp
         src/win32_helpers.cpp
     )
     target_compile_features(enumeration_smoke PRIVATE cxx_std_20)
@@ -73,4 +82,22 @@ if(BUILD_TESTING)
         Advapi32 Cfgmgr32 Setupapi Shell32 User32
     )
     add_test(NAME enumeration_smoke COMMAND enumeration_smoke)
+
+    add_executable(bluetooth_smoke
+        tests/bluetooth_smoke.cpp
+        src/bluetooth_manager.cpp
+    )
+    target_compile_features(bluetooth_smoke PRIVATE cxx_std_20)
+    target_compile_definitions(bluetooth_smoke PRIVATE
+        UNICODE
+        _UNICODE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_include_directories(bluetooth_smoke PRIVATE src)
+    target_link_libraries(bluetooth_smoke PRIVATE Bthprops)
+    add_test(NAME bluetooth_smoke COMMAND bluetooth_smoke)
+
+    add_test(NAME gui_smoke COMMAND Sonic79Reconstructed --smoke-test)
+    set_tests_properties(gui_smoke PROPERTIES TIMEOUT 30)
 endif()

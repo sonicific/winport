@@ -13,6 +13,7 @@ ListDevsSw=0
 DeviceNameColumnWidth=330
 LastUsedColumnWidth=130
 ClassColumnWidth=120
+SafetyColumnWidth=180
 EnumeratorColumnWidth=110
 ServiceColumnWidth=110
 ComPortColumnWidth=80

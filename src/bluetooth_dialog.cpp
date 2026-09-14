@@ -46,7 +46,10 @@ public:
         UpdateWindow(window_);
 
         MSG message{};
-        while (!closed_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        int message_result = 1;
+        while (!closed_ &&
+               (message_result = static_cast<int>(
+                    GetMessageW(&message, nullptr, 0, 0))) > 0) {
             if (!IsDialogMessageW(window_, &message)) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -55,6 +58,9 @@ public:
 
         EnableWindow(parent_, TRUE);
         SetForegroundWindow(parent_);
+        if (message_result == 0) {
+            PostQuitMessage(static_cast<int>(message.wParam));
+        }
     }
 
 private:
@@ -100,6 +106,13 @@ private:
                     DestroyWindow(window_);
                 }
                 return 0;
+            case WM_NOTIFY:
+                if (reinterpret_cast<NMHDR*>(lparam)->hwndFrom == list_ &&
+                    reinterpret_cast<NMHDR*>(lparam)->code == LVN_ITEMCHANGED) {
+                    EnableWindow(remove_button_,
+                                 ListView_GetSelectedCount(list_) != 0);
+                }
+                return 0;
             case WM_CLOSE:
                 DestroyWindow(window_);
                 return 0;
@@ -143,6 +156,7 @@ private:
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 0, 0,
             window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseButtonId)),
             GetModuleHandleW(nullptr), nullptr);
+        EnableWindow(remove_button_, FALSE);
     }
 
     void Layout(int width, int height) const {

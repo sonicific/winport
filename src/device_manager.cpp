@@ -1,6 +1,7 @@
 #include "device_manager.h"
 
 #include "com_port_manager.h"
+#include "process_runner.h"
 #include "win32_helpers.h"
 
 #include <initguid.h>
@@ -8,6 +9,7 @@
 #include <setupapi.h>
 
 #include <array>
+#include <thread>
 #include <vector>
 
 namespace sonic79 {
@@ -150,6 +152,19 @@ bool IsStillRegistered(std::wstring_view instance_id) {
                               CM_LOCATE_DEVNODE_PHANTOM) == CR_SUCCESS;
 }
 
+bool WaitUntilUnregistered(std::wstring_view instance_id) {
+    constexpr std::array<DWORD, 6> kRetryDelaysMs{0, 50, 100, 200, 400, 800};
+    for (const DWORD delay : kRetryDelaysMs) {
+        if (delay != 0) {
+            Sleep(delay);
+        }
+        if (!IsStillRegistered(instance_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool RemoveWithSetupApi(std::wstring_view instance_id, DWORD* error,
                         bool* reboot_required) {
     UniqueDeviceInfoSet set(SetupDiCreateDeviceInfoList(nullptr, nullptr));
@@ -186,6 +201,86 @@ bool RemoveWithSetupApi(std::wstring_view instance_id, DWORD* error,
             (install_parameters.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)) != 0;
     }
     return true;
+}
+
+std::wstring PnpUtilPath() {
+    std::array<wchar_t, MAX_PATH> system_directory{};
+    const UINT size = GetSystemDirectoryW(system_directory.data(),
+                                          static_cast<UINT>(system_directory.size()));
+    if (size == 0 || size >= system_directory.size()) {
+        return {};
+    }
+    std::wstring path(system_directory.data(), size);
+    path.append(L"\\pnputil.exe");
+    return path;
+}
+
+bool RemoveWithPnpUtil(std::wstring_view instance_id, DWORD* error) {
+    const std::wstring executable = PnpUtilPath();
+    if (executable.empty()) {
+        *error = GetLastError();
+        return false;
+    }
+
+    const ProcessResult process = RunHiddenProcess(
+        executable, {L"/remove-device", std::wstring(instance_id)}, 30000);
+    if (!process.started || !process.completed) {
+        *error = process.win32_error;
+        return false;
+    }
+    if (process.exit_code != 0) {
+        *error = ERROR_GEN_FAILURE;
+        return false;
+    }
+    return true;
+}
+
+struct ValidatedRemovalTarget {
+    RemovalEligibilityResult result;
+    DEVINST dev_inst = 0;
+};
+
+ValidatedRemovalTarget ValidateRemovalTarget(std::wstring_view instance_id,
+                                             bool allow_protected) {
+    ValidatedRemovalTarget validation;
+    if (instance_id.empty()) {
+        validation.result.state = RemovalEligibility::invalid_id;
+        validation.result.config_result = CR_INVALID_DEVICE_ID;
+        return validation;
+    }
+
+    std::wstring mutable_id(instance_id);
+    validation.result.config_result = CM_Locate_DevNodeW(
+        &validation.dev_inst, mutable_id.data(), CM_LOCATE_DEVNODE_PHANTOM);
+    if (validation.result.config_result == CR_NO_SUCH_DEVNODE) {
+        validation.result.state = RemovalEligibility::already_absent;
+        return validation;
+    }
+    if (validation.result.config_result != CR_SUCCESS) {
+        validation.result.state = RemovalEligibility::lookup_error;
+        return validation;
+    }
+
+    DWORD current_status = 0;
+    DWORD current_problem = 0;
+    validation.result.config_result = CM_Get_DevNode_Status(
+        &current_status, &current_problem, validation.dev_inst, 0);
+    const bool confirmed_phantom =
+        validation.result.config_result == CR_NO_SUCH_DEVNODE ||
+        (validation.result.config_result == CR_SUCCESS &&
+         current_problem == CM_PROB_PHANTOM);
+    if (!confirmed_phantom) {
+        validation.result.state = RemovalEligibility::present_or_unconfirmed;
+        return validation;
+    }
+
+    validation.result.protection = AnalyzeDeviceProtection(instance_id);
+    if (IsProtected(validation.result.protection) && !allow_protected) {
+        validation.result.state = RemovalEligibility::protected_device;
+        return validation;
+    }
+    validation.result.state = RemovalEligibility::eligible;
+    return validation;
 }
 
 }  // namespace
@@ -249,6 +344,8 @@ EnumerationResult DeviceManager::EnumerateNonPresent(
         device.last_connected = ReadLastConnected(info.DevInst, device.instance_id);
         device.status = status;
         device.problem_code = problem;
+        device.status_result = status_result;
+        device.protection = AnalyzeDeviceProtection(device.instance_id);
         result.devices.push_back(std::move(device));
 
         if (progress) {
@@ -258,28 +355,46 @@ EnumerationResult DeviceManager::EnumerateNonPresent(
     return result;
 }
 
-RemovalResult DeviceManager::Remove(const DeviceRecord& device) {
+RemovalResult DeviceManager::Remove(const DeviceRecord& device,
+                                    bool allow_protected) {
     RemovalResult result;
-    DEVINST dev_inst = 0;
-    std::wstring mutable_id = device.instance_id;
-    result.config_result = CM_Locate_DevNodeW(
-        &dev_inst, mutable_id.data(), CM_LOCATE_DEVNODE_PHANTOM);
-    if (result.config_result != CR_SUCCESS) {
+    const ValidatedRemovalTarget validation =
+        ValidateRemovalTarget(device.instance_id, allow_protected);
+    result.config_result = validation.result.config_result;
+    if (validation.result.state == RemovalEligibility::already_absent) {
+        result.removed = true;
+        return result;
+    }
+    if (validation.result.state == RemovalEligibility::present_or_unconfirmed) {
+        result.skipped_present = true;
+        return result;
+    }
+    if (validation.result.state == RemovalEligibility::protected_device) {
+        result.skipped_protected = true;
+        return result;
+    }
+    if (validation.result.state != RemovalEligibility::eligible) {
         return result;
     }
 
-    result.config_result = CM_Uninstall_DevNode(dev_inst, 0);
+    result.config_result = CM_Uninstall_DevNode(validation.dev_inst, 0);
     if (result.config_result == CR_SUCCESS) {
         result.removed = true;
-    } else if (result.config_result == CR_CALL_NOT_IMPLEMENTED ||
-               result.config_result == CR_INVALID_FLAG) {
+        result.method = RemovalMethod::configuration_manager;
+    } else {
         result.removed =
             RemoveWithSetupApi(device.instance_id, &result.win32_error,
                                &result.reboot_required);
+        if (result.removed) {
+            result.method = RemovalMethod::setup_api;
+        } else if (RemoveWithPnpUtil(device.instance_id, &result.win32_error)) {
+            result.removed = true;
+            result.method = RemovalMethod::pnputil;
+        }
     }
 
     if (result.removed) {
-        result.still_present = IsStillRegistered(device.instance_id);
+        result.still_present = !WaitUntilUnregistered(device.instance_id);
         if (!result.still_present && !device.com_port.empty()) {
             result.com_reservation_released =
                 ComPortManager::ReleaseReservationIfUnused(device.com_port,
@@ -287,6 +402,21 @@ RemovalResult DeviceManager::Remove(const DeviceRecord& device) {
         }
     }
     return result;
+}
+
+RemovalEligibilityResult DeviceManager::CheckRemovalEligibility(
+    std::wstring_view instance_id, bool allow_protected) {
+    return ValidateRemovalTarget(instance_id, allow_protected).result;
+}
+
+CONFIGRET DeviceManager::RequestReenumeration() {
+    DEVINST root = 0;
+    CONFIGRET result = CM_Locate_DevNodeW(&root, nullptr,
+                                          CM_LOCATE_DEVNODE_NORMAL);
+    if (result != CR_SUCCESS) {
+        return result;
+    }
+    return CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS);
 }
 
 bool DeviceManager::OpenProperties(HWND owner, const DeviceRecord& device) {

@@ -25,7 +25,7 @@ BluetoothEnumerationResult BluetoothManager::EnumerateDisconnected() {
         search.dwSize = sizeof(search);
         search.fReturnAuthenticated = TRUE;
         search.fReturnRemembered = TRUE;
-        search.fReturnUnknown = TRUE;
+        search.fReturnUnknown = FALSE;
         search.fReturnConnected = TRUE;
         search.fIssueInquiry = FALSE;
         search.cTimeoutMultiplier = 1;
@@ -49,12 +49,29 @@ BluetoothEnumerationResult BluetoothManager::EnumerateDisconnected() {
                 }
                 info = BLUETOOTH_DEVICE_INFO{sizeof(info)};
             } while (BluetoothFindNextDevice(device_find, &info));
+            const DWORD find_error = GetLastError();
+            if (find_error != ERROR_NO_MORE_ITEMS && find_error != ERROR_SUCCESS &&
+                result.error == ERROR_SUCCESS) {
+                result.error = find_error;
+            }
             BluetoothFindDeviceClose(device_find);
+        } else {
+            const DWORD find_error = GetLastError();
+            if (find_error != ERROR_NO_MORE_ITEMS && find_error != ERROR_SUCCESS &&
+                result.error == ERROR_SUCCESS) {
+                result.error = find_error;
+            }
         }
 
         CloseHandle(radio);
         radio = nullptr;
     } while (BluetoothFindNextRadio(radio_find, &radio));
+
+    const DWORD radio_error = GetLastError();
+    if (radio_error != ERROR_NO_MORE_ITEMS && radio_error != ERROR_SUCCESS &&
+        result.error == ERROR_SUCCESS) {
+        result.error = radio_error;
+    }
 
     BluetoothFindRadioClose(radio_find);
     return result;

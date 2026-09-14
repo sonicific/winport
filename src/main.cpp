@@ -6,8 +6,8 @@
 
 #include <string_view>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line,
-                    int show_command) {
+int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
+                    _In_ PWSTR command_line, _In_ int show_command) {
     INITCOMMONCONTROLSEX controls{sizeof(controls)};
     controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&controls);

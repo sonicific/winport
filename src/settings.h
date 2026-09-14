@@ -25,6 +25,7 @@ struct AppSettings {
     int device_name_width = 330;
     int last_connected_width = 130;
     int class_width = 120;
+    int safety_width = 180;
     int enumerator_width = 110;
     int service_width = 110;
     int com_port_width = 80;
@@ -40,7 +41,8 @@ public:
     const std::filesystem::path& path() const { return path_; }
 
 private:
-    std::filesystem::path path_;
+    mutable std::filesystem::path path_;
+    std::filesystem::path fallback_path_;
 };
 
 }  // namespace sonic79

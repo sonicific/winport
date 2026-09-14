@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <future>
 #include <sstream>
 #include <string>
 
@@ -22,6 +24,7 @@ constexpr wchar_t kWindowClass[] = L"Sonic79ReconstructedMainWindow";
 constexpr wchar_t kBaseTitle[] = L"Sonic79 Reconstructed (x64)";
 constexpr UINT_PTR kDeviceRefreshTimer = 1;
 constexpr UINT_PTR kSmokeTestTimer = 2;
+constexpr UINT_PTR kScanPollTimer = 3;
 
 bool SetClipboardText(HWND owner, std::wstring_view text) {
     if (!OpenClipboard(owner)) {
@@ -164,10 +167,7 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                 SetWindowPos(window_, HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
-            RefreshDevices();
-            if (smoke_test_) {
-                SetTimer(window_, kSmokeTestTimer, 50, nullptr);
-            }
+            BeginRefreshDevices();
             return 0;
         case WM_SIZE:
             LayoutControls(LOWORD(lparam), HIWORD(lparam));
@@ -185,10 +185,12 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         case WM_TIMER:
             if (wparam == kDeviceRefreshTimer) {
                 KillTimer(window_, kDeviceRefreshTimer);
-                RefreshDevices();
+                BeginRefreshDevices();
             } else if (wparam == kSmokeTestTimer) {
                 KillTimer(window_, kSmokeTestTimer);
                 PostMessageW(window_, WM_CLOSE, 0, 0);
+            } else if (wparam == kScanPollTimer) {
+                FinishRefreshDevices();
             }
             return 0;
         case WM_GETMINMAXINFO: {
@@ -197,11 +199,15 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
         case WM_CLOSE:
+            closing_ = true;
+            KillTimer(window_, kDeviceRefreshTimer);
+            KillTimer(window_, kScanPollTimer);
+            KillTimer(window_, kSmokeTestTimer);
             SaveSettings();
             DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
-            PostQuitMessage(0);
+            PostQuitMessage(exit_code_);
             return 0;
         default:
             return DefWindowProcW(window_, message, wparam, lparam);
@@ -222,8 +228,12 @@ void AppWindow::CreateApplicationMenu() {
 
     HMENU devices_menu = CreatePopupMenu();
     AppendMenuW(devices_menu, MF_STRING, command::select_all, L"Select &all\tCtrl+A");
+    AppendMenuW(devices_menu, MF_STRING, command::select_none, L"Select &none");
     AppendMenuW(devices_menu, MF_STRING, command::remove_selected,
                 L"&Remove selected\tDelete");
+    AppendMenuW(devices_menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(devices_menu, MF_STRING, command::allow_protected_removal,
+                L"Allow removal of &protected devices (session only)");
 
     HMENU columns_menu = CreatePopupMenu();
     AppendMenuW(columns_menu, MF_STRING, command::show_enumerator, L"&Enumerator");
@@ -293,6 +303,7 @@ void AppWindow::BuildColumns() {
     visible_columns_.push_back(DeviceColumn::name);
     visible_columns_.push_back(DeviceColumn::last_connected);
     visible_columns_.push_back(DeviceColumn::class_name);
+    visible_columns_.push_back(DeviceColumn::safety);
     if (settings_.show_enumerator) {
         visible_columns_.push_back(DeviceColumn::enumerator);
     }
@@ -318,6 +329,9 @@ void AppWindow::BuildColumns() {
                 break;
             case DeviceColumn::class_name:
                 title = L"Class";
+                break;
+            case DeviceColumn::safety:
+                title = L"Safety";
                 break;
             case DeviceColumn::enumerator:
                 title = L"Enumerator";
@@ -348,21 +362,87 @@ void AppWindow::SaveColumnWidths() {
     }
 }
 
-void AppWindow::RefreshDevices() {
-    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+void AppWindow::BeginRefreshDevices() {
+    if (scan_in_progress_) {
+        refresh_pending_ = true;
+        return;
+    }
+
+    scan_in_progress_ = true;
+    refresh_pending_ = false;
     SendMessageW(status_, SB_SETTEXTW, 0,
                  reinterpret_cast<LPARAM>(L"Scanning Windows device tree..."));
-    const EnumerationResult result =
-        DeviceManager::EnumerateNonPresent(settings_.filters);
+    UpdateMenuState();
+    const DeviceFilters filters = settings_.filters;
+    scan_future_ = std::async(std::launch::async, [filters] {
+        return DeviceManager::EnumerateNonPresent(filters);
+    });
+    SetTimer(window_, kScanPollTimer, 50, nullptr);
+}
+
+void AppWindow::FinishRefreshDevices() {
+    if (!scan_in_progress_ || !scan_future_.valid() ||
+        scan_future_.wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready) {
+        return;
+    }
+
+    KillTimer(window_, kScanPollTimer);
+    EnumerationResult result;
+    try {
+        result = scan_future_.get();
+    } catch (...) {
+        scan_in_progress_ = false;
+        exit_code_ = 2;
+        MessageBoxW(window_, L"An unexpected error stopped device enumeration.",
+                    L"Device enumeration failed", MB_OK | MB_ICONERROR);
+        UpdateMenuState();
+        if (smoke_test_) {
+            SetTimer(window_, kSmokeTestTimer, 50, nullptr);
+        }
+        return;
+    }
+    scan_in_progress_ = false;
+    if (closing_) {
+        return;
+    }
     devices_ = result.devices;
     SortDevices();
     PopulateList();
-    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
 
     if (result.win32_error != ERROR_SUCCESS) {
         MessageBoxW(window_, FormatWin32Error(result.win32_error).c_str(),
                     L"Device enumeration failed", MB_OK | MB_ICONERROR);
     }
+    if (refresh_pending_) {
+        BeginRefreshDevices();
+    } else if (smoke_test_) {
+        exit_code_ = ValidateSmokeState() ? 0 : 2;
+        SetTimer(window_, kSmokeTestTimer, 50, nullptr);
+    }
+}
+
+bool AppWindow::ValidateSmokeState() const {
+    if (!IsWindow(window_) || !IsWindow(list_) || !IsWindow(status_) ||
+        menu_ == nullptr) {
+        return false;
+    }
+    const HWND header = ListView_GetHeader(list_);
+    if (!IsWindow(header) ||
+        Header_GetItemCount(header) != static_cast<int>(visible_columns_.size()) ||
+        ListView_GetItemCount(list_) != static_cast<int>(devices_.size())) {
+        return false;
+    }
+    if (GetMenuState(menu_, command::allow_protected_removal, MF_BYCOMMAND) ==
+        static_cast<UINT>(-1)) {
+        return false;
+    }
+    return std::all_of(devices_.begin(), devices_.end(), [](const auto& device) {
+        return !device.instance_id.empty() &&
+               (device.status_result == CR_NO_SUCH_DEVNODE ||
+                (device.status_result == CR_SUCCESS &&
+                 device.problem_code == CM_PROB_PHANTOM));
+    });
 }
 
 void AppWindow::PopulateList() {
@@ -419,9 +499,15 @@ void AppWindow::SortDevices() {
 
 void AppWindow::UpdateStatus() {
     const size_t selection_count = SelectedDeviceIndices().size();
+    const size_t protected_count = static_cast<size_t>(std::count_if(
+        devices_.begin(), devices_.end(), [](const DeviceRecord& device) {
+            return IsProtected(device.protection);
+        }));
     std::wstring text = L"  Non-present devices: " +
                         std::to_wstring(devices_.size()) + L"    Selected: " +
-                        std::to_wstring(selection_count) + L"    (F5 refreshes)";
+                        std::to_wstring(selection_count) + L"    Protected: " +
+                        std::to_wstring(protected_count) + L"    Removed this session: " +
+                        std::to_wstring(removed_session_count_) + L"    (F5 refreshes)";
     SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
 }
 
@@ -438,10 +524,15 @@ void AppWindow::UpdateMenuState() {
     check(command::show_sw, settings_.filters.include_sw);
     check(command::dark_mode, settings_.dark_mode);
     check(command::always_on_top, settings_.always_on_top);
+    check(command::allow_protected_removal, allow_protected_removal_);
 
     EnableMenuItem(menu_, command::remove_selected,
-                   MF_BYCOMMAND | (SelectedDeviceIndices().empty() ? MF_GRAYED
-                                                                   : MF_ENABLED));
+                   MF_BYCOMMAND |
+                       (scan_in_progress_ || SelectedDeviceIndices().empty()
+                            ? MF_GRAYED
+                            : MF_ENABLED));
+    EnableMenuItem(menu_, command::refresh,
+                   MF_BYCOMMAND | (scan_in_progress_ ? MF_GRAYED : MF_ENABLED));
     EnableMenuItem(menu_, command::restart_elevated,
                    MF_BYCOMMAND | (administrator_ ? MF_GRAYED : MF_ENABLED));
     DrawMenuBar(window_);
@@ -479,7 +570,7 @@ void AppWindow::SaveSettings() {
 void AppWindow::HandleCommand(int command_id) {
     switch (command_id) {
         case command::refresh:
-            RefreshDevices();
+            BeginRefreshDevices();
             break;
         case command::restart_elevated:
             if (RestartElevated(window_)) {
@@ -498,6 +589,9 @@ void AppWindow::HandleCommand(int command_id) {
             break;
         case command::select_all:
             SelectAll();
+            break;
+        case command::select_none:
+            SelectNone();
             break;
         case command::remove_selected:
             RemoveSelected();
@@ -536,7 +630,7 @@ void AppWindow::HandleCommand(int command_id) {
                 settings_.filters.include_sw = !settings_.filters.include_sw;
             }
             UpdateMenuState();
-            RefreshDevices();
+            BeginRefreshDevices();
             break;
         case command::dark_mode:
             settings_.dark_mode = !settings_.dark_mode;
@@ -548,6 +642,21 @@ void AppWindow::HandleCommand(int command_id) {
             SetWindowPos(window_, settings_.always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST,
                          0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            UpdateMenuState();
+            break;
+        case command::allow_protected_removal:
+            if (allow_protected_removal_) {
+                allow_protected_removal_ = false;
+            } else if (MessageBoxW(
+                           window_,
+                           L"Protected entries include ROOT/software-enumerated devices "
+                           L"and devices with explicit interrupt affinity. Removing them "
+                           L"can disrupt Windows, drivers, or tuned performance.\r\n\r\n"
+                           L"Enable protected-device removal for this session?",
+                           L"Advanced safety override",
+                           MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                allow_protected_removal_ = true;
+            }
             UpdateMenuState();
             break;
         case command::bluetooth:
@@ -649,6 +758,12 @@ void AppWindow::SelectAll() {
     UpdateMenuState();
 }
 
+void AppWindow::SelectNone() {
+    ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    UpdateStatus();
+    UpdateMenuState();
+}
+
 void AppWindow::RemoveSelected() {
     const std::vector<size_t> indices = SelectedDeviceIndices();
     if (indices.empty()) {
@@ -662,6 +777,32 @@ void AppWindow::RemoveSelected() {
             RestartElevated(window_)) {
             PostMessageW(window_, WM_CLOSE, 0, 0);
         }
+        return;
+    }
+
+    const size_t protected_count = static_cast<size_t>(std::count_if(
+        indices.begin(), indices.end(), [this](size_t index) {
+            return index < devices_.size() && IsProtected(devices_[index].protection);
+        }));
+    if (protected_count != 0 && !allow_protected_removal_) {
+        MessageBoxW(
+            window_,
+            (std::to_wstring(protected_count) +
+             L" selected device(s) are protected. Deselect them, or explicitly enable "
+             L"the session-only override under Devices after reviewing the Safety column.")
+                .c_str(),
+            L"Protected devices were not removed", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (protected_count != 0 &&
+        MessageBoxW(
+            window_,
+            (L"You selected " + std::to_wstring(protected_count) +
+             L" protected device(s). This can disrupt Windows, drivers, or explicit "
+             L"interrupt-affinity tuning. Continue anyway?")
+                .c_str(),
+            L"Confirm protected-device removal",
+            MB_YESNO | MB_ICONSTOP | MB_DEFBUTTON2) != IDYES) {
         return;
     }
 
@@ -701,7 +842,8 @@ void AppWindow::RemoveSelected() {
     for (const DeviceRecord& device : selected_devices) {
         SendMessageW(status_, SB_SETTEXTW, 0,
                      reinterpret_cast<LPARAM>((L"Removing: " + device.name).c_str()));
-        const RemovalResult removal = DeviceManager::Remove(device);
+        const RemovalResult removal =
+            DeviceManager::Remove(device, allow_protected_removal_);
         reboot_required |= removal.reboot_required;
         if (removal.removed && !removal.still_present) {
             ++removed_count;
@@ -709,7 +851,11 @@ void AppWindow::RemoveSelected() {
         }
 
         failures += device.name + L" (" + device.instance_id + L"): ";
-        if (removal.still_present) {
+        if (removal.skipped_present) {
+            failures += L"skipped because it is no longer a confirmed ghost device";
+        } else if (removal.skipped_protected) {
+            failures += L"skipped because its protection state changed";
+        } else if (removal.still_present) {
             failures += L"device removal was requested but the device is still registered";
         } else if (removal.win32_error != ERROR_SUCCESS) {
             failures += FormatWin32Error(removal.win32_error);
@@ -718,8 +864,12 @@ void AppWindow::RemoveSelected() {
         }
         failures += L"\r\n";
     }
+    if (!selected_devices.empty()) {
+        DeviceManager::RequestReenumeration();
+    }
+    removed_session_count_ += removed_count;
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-    RefreshDevices();
+    BeginRefreshDevices();
 
     std::wstring summary = std::to_wstring(removed_count) + L" of " +
                            std::to_wstring(selected_devices.size()) +
@@ -774,6 +924,9 @@ void AppWindow::CopySelected() {
                 break;
             case DeviceColumn::class_name:
                 text += L"Class";
+                break;
+            case DeviceColumn::safety:
+                text += L"Safety";
                 break;
             case DeviceColumn::enumerator:
                 text += L"Enumerator";
@@ -836,6 +989,8 @@ std::wstring AppWindow::ColumnText(const DeviceRecord& device,
             return device.last_connected ? FormatFileTime(*device.last_connected) : L"";
         case DeviceColumn::class_name:
             return device.class_name;
+        case DeviceColumn::safety:
+            return DescribeDeviceProtection(device.protection);
         case DeviceColumn::enumerator:
             return device.enumerator;
         case DeviceColumn::service:
@@ -856,6 +1011,8 @@ int AppWindow::ColumnWidth(DeviceColumn column) const {
             return settings_.last_connected_width;
         case DeviceColumn::class_name:
             return settings_.class_width;
+        case DeviceColumn::safety:
+            return settings_.safety_width;
         case DeviceColumn::enumerator:
             return settings_.enumerator_width;
         case DeviceColumn::service:
@@ -878,6 +1035,9 @@ void AppWindow::SetColumnWidth(DeviceColumn column, int width) {
             break;
         case DeviceColumn::class_name:
             settings_.class_width = width;
+            break;
+        case DeviceColumn::safety:
+            settings_.safety_width = width;
             break;
         case DeviceColumn::enumerator:
             settings_.enumerator_width = width;
